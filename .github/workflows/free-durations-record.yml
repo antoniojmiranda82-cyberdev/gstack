@@ -12,8 +12,6 @@ name: Free-suite duration seeds
 # nothing (docs/TESTING_INTERNALS.md#free-suite-duration-seed).
 
 on:
-  schedule:
-    - cron: '0 4 * * 1'  # Monday 04:00 UTC, before the 10:00 test-health run
   workflow_dispatch:
     inputs:
       open_pr:
