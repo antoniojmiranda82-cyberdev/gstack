@@ -22,14 +22,6 @@ name: Periodic Evals
 # eval-bg (scripts/eval-bg.ts) finds its dispatch by the nonce in the run name.
 run-name: ${{ inputs.nonce && format('Periodic Evals [eval-bg {0}]', inputs.nonce) || 'Periodic Evals' }}
 on:
-  schedule:
-    - cron: '0 6 * * 1'  # Monday 6 AM UTC; build-image below builds or reuses the CI image
-    # Daily, for autoplan-schema-canary alone (latest Claude Code vs the /autoplan
-    # guard's payload assumptions); every census job below skips this schedule.
-    - cron: '30 7 * * *'
-    # Monthly, the census jobs alone with the claude-fable and codex-astra arms
-    # (the 1st; never combined with a day of week, which cron would OR).
-    - cron: '0 6 1 * *'
   workflow_dispatch:
     inputs:
       redispatch_of:
