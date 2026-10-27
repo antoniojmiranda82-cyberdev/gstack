@@ -15,8 +15,6 @@ name: Weekly test health
 # Pinned by test/test-health-workflow.test.ts.
 
 on:
-  schedule:
-    - cron: '0 10 * * 1'
   workflow_dispatch:
 
 permissions:
