@@ -10,8 +10,6 @@ name: Eval sweep
 # an agent fixes from the uploaded report. Pinned by
 # test/eval-sweep-workflow.test.ts.
 on:
-  schedule:
-    - cron: '0 12 * * 1'  # Monday 12:00 UTC, after the 06:00 periodic census
   workflow_dispatch:
     inputs:
       k:
