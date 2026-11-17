@@ -13,6 +13,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { spawnSync } from "child_process";
+import { gitEnv } from "./helpers/git-env";
 
 const PREPUSH = path.resolve(import.meta.dir, "..", "bin", "gstack-redact-prepush");
 const REDACT = path.resolve(import.meta.dir, "..", "bin", "gstack-redact");
@@ -21,7 +22,7 @@ let repo: string;
 let stateHome: string;
 
 function git(args: string[], cwd = repo): string {
-  const r = spawnSync("git", args, { cwd, encoding: "utf8", timeout: 30_000 });
+  const r = spawnSync("git", args, { cwd, encoding: "utf8", timeout: 30_000, env: gitEnv() });
   return r.stdout?.trim() ?? "";
 }
 
@@ -40,7 +41,7 @@ function runHook(
     cwd: repo,
     input: Buffer.from(stdinLines),
     encoding: "utf8",
-    env: { ...process.env, ...env },
+    env: gitEnv(env),
     timeout: 30_000,
   });
   return { code: r.status ?? 0, stderr: r.stderr ?? "" };
@@ -70,6 +71,18 @@ const ZERO = "0000000000000000000000000000000000000000";
 // repo's own pre-push scanner (correctly) blocks live-format AWS key shapes,
 // and the placeholder-suppressed docs key would defeat these detection tests.
 const FAKE_AWS_KEY = ['AKIA', '1234567890ABCDEF'].join('');
+const FAKE_PAT = ["ghp", "Zq8Lm2Xv7Nc4Rt9Wy1Kp6Hd3Fs5Gb0Jx8Ue2"].join("_");
+const utf16 = (text: string, bigEndian = false) => { const le = Buffer.from(`\uFEFF${text}`, "utf16le"); return bigEndian ? le.swap16() : le; };
+
+function commitFiles(files: Record<string, string | Buffer>, msg: string): string {
+  for (const [rel, content] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(repo, rel)), { recursive: true });
+    fs.writeFileSync(path.join(repo, rel), content);
+  }
+  git(["add", "-A"]);
+  git(["commit", "-q", "-m", msg]);
+  return git(["rev-parse", "HEAD"]);
+}
 
 
 beforeEach(() => {
@@ -439,7 +452,7 @@ describe("install UX surfaces (#1946 / eng review D3+D10)", () => {
         const r = spawnSync("bash", ["-c", script], {
           encoding: "utf8",
           stdio: ["ignore", "pipe", "pipe"], // stdin not a TTY
-          env: { ...process.env, GSTACK_HOME: home },
+          env: gitEnv({ GSTACK_HOME: home }),
           timeout: 15_000,
         });
         expect(r.status).toBe(0);
@@ -467,7 +480,7 @@ describe("install UX surfaces (#1946 / eng review D3+D10)", () => {
         const r = spawnSync("bash", ["-c", script], {
           encoding: "utf8",
           stdio: ["ignore", "pipe", "pipe"],
-          env: { ...process.env, GSTACK_HOME: home },
+          env: gitEnv({ GSTACK_HOME: home }),
           timeout: 15_000,
         });
         expect(r.status).toBe(0);
@@ -502,7 +515,7 @@ describe("install / chaining", () => {
     const existing = path.join(hookDir, "pre-push");
     fs.writeFileSync(existing, "#!/usr/bin/env bash\necho mine\n", { mode: 0o755 });
 
-    const r = spawnSync("bun", [REDACT, "install-prepush-hook"], { cwd: repo, encoding: "utf8", timeout: 30_000 });
+    const r = spawnSync("bun", [REDACT, "install-prepush-hook"], { cwd: repo, encoding: "utf8", timeout: 30_000, env: gitEnv() });
     expect(r.status).toBe(0);
     const installed = fs.readFileSync(existing, "utf8");
     expect(installed).toContain("gstack-redact pre-push (managed)");
@@ -516,7 +529,7 @@ describe("install / chaining", () => {
   test("chained pre-push.local receives the final ref line (trailing newline preserved)", () => {
     const hookDir = path.join(repo, ".git", "hooks");
     fs.mkdirSync(hookDir, { recursive: true });
-    spawnSync("bun", [REDACT, "install-prepush-hook"], { cwd: repo, timeout: 30_000 });
+    spawnSync("bun", [REDACT, "install-prepush-hook"], { cwd: repo, timeout: 30_000, env: gitEnv() });
 
     const seen = path.join(repo, "seen.txt");
     fs.writeFileSync(
@@ -531,7 +544,7 @@ describe("install / chaining", () => {
       cwd: repo,
       input: Buffer.from(line),
       encoding: "utf8",
-      env: { ...process.env, GSTACK_REDACT_PREPUSH: "skip", GSTACK_HOME: stateHome },
+      env: gitEnv({ GSTACK_REDACT_PREPUSH: "skip", GSTACK_HOME: stateHome }),
       timeout: 30_000,
     });
     expect(r.status).toBe(0);
@@ -545,7 +558,7 @@ describe("install / chaining", () => {
   test("a blocking pre-push.local still short-circuits the push", () => {
     const hookDir = path.join(repo, ".git", "hooks");
     fs.mkdirSync(hookDir, { recursive: true });
-    spawnSync("bun", [REDACT, "install-prepush-hook"], { cwd: repo, timeout: 30_000 });
+    spawnSync("bun", [REDACT, "install-prepush-hook"], { cwd: repo, timeout: 30_000, env: gitEnv() });
     fs.writeFileSync(
       path.join(hookDir, "pre-push.local"),
       "#!/usr/bin/env bash\nwhile read -r _a _b _c _d || [ -n \"${_a:-}\" ]; do exit 1; done\nexit 0\n",
@@ -555,7 +568,7 @@ describe("install / chaining", () => {
       cwd: repo,
       input: Buffer.from(`refs/heads/main ${"b".repeat(40)} refs/heads/main ${ZERO}\n`),
       encoding: "utf8",
-      env: { ...process.env, GSTACK_REDACT_PREPUSH: "skip", GSTACK_HOME: stateHome },
+      env: gitEnv({ GSTACK_REDACT_PREPUSH: "skip", GSTACK_HOME: stateHome }),
       timeout: 30_000,
     });
     expect(r.status).toBe(1);
@@ -603,6 +616,7 @@ describe("install / chaining", () => {
       timeout: 30_000,
       cwd: repo,
       encoding: "utf8",
+      env: gitEnv(),
     });
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("refreshed stale managed pre-push hook");
@@ -618,7 +632,7 @@ describe("install / chaining", () => {
       cwd: repo,
       input: Buffer.from(`refs/heads/main ${sha} refs/heads/main ${ZERO}\n`),
       encoding: "utf8",
-      env: { ...process.env, GSTACK_REDACT_PREPUSH: "skip", GSTACK_HOME: stateHome },
+      env: gitEnv({ GSTACK_REDACT_PREPUSH: "skip", GSTACK_HOME: stateHome }),
     });
     expect(run.status).toBe(0);
     expect(fs.readFileSync(path.join(stateHome, "security", "prepush-skip.jsonl"), "utf8")).toContain("env-skip");
@@ -630,13 +644,14 @@ describe("install / chaining", () => {
     fs.mkdirSync(hookDir, { recursive: true });
     const hook = path.join(hookDir, "pre-push");
 
-    spawnSync("bun", [REDACT, "install-prepush-hook"], { cwd: repo });
+    spawnSync("bun", [REDACT, "install-prepush-hook"], { cwd: repo, env: gitEnv() });
     const first = fs.readFileSync(hook, "utf8");
     const stamp = fs.statSync(hook).mtimeMs;
 
     const again = spawnSync("bun", [REDACT, "install-prepush-hook"], {
       cwd: repo,
       encoding: "utf8",
+      env: gitEnv(),
     });
     expect(again.status).toBe(0);
     expect(again.stdout).toContain("already installed");
@@ -651,8 +666,8 @@ describe("install / chaining", () => {
     fs.writeFileSync(path.join(hookDir, "pre-push"), "#!/usr/bin/env bash\necho mine\n", {
       mode: 0o755,
     });
-    spawnSync("bun", [REDACT, "install-prepush-hook"], { cwd: repo, timeout: 30_000 });
-    spawnSync("bun", [REDACT, "uninstall-prepush-hook"], { cwd: repo, timeout: 30_000 });
+    spawnSync("bun", [REDACT, "install-prepush-hook"], { cwd: repo, timeout: 30_000, env: gitEnv() });
+    spawnSync("bun", [REDACT, "uninstall-prepush-hook"], { cwd: repo, timeout: 30_000, env: gitEnv() });
     const restored = fs.readFileSync(path.join(hookDir, "pre-push"), "utf8");
     expect(restored).toContain("echo mine");
     expect(restored).not.toContain("managed");
@@ -671,7 +686,7 @@ describe("base resolution when the default branch is neither main nor master", (
     // blocks the push having scanned NOTHING — the "scans more, never less"
     // fallback inverting into "scans nothing".
     const bare = fs.mkdtempSync(path.join(os.tmpdir(), "prepush-remote-"));
-    spawnSync("git", ["init", "-q", "--bare", "-b", "trunk", bare], { timeout: 30_000 });
+    spawnSync("git", ["init", "-q", "--bare", "-b", "trunk", bare], { timeout: 30_000, env: gitEnv() });
 
     git(["branch", "-M", "trunk"]);
     const old = commit("legacy.txt", FAKE_AWS_KEY + "\n", "secret already on the remote");
@@ -757,5 +772,107 @@ describe("#3048: the pushed diff is scanned per file, so TS/JSX source syntax is
     git(["commit", "-q", "-m", "yaml"]);
     const yamlHead = git(["rev-parse", "HEAD"]);
     expect(mediums(runHook(`refs/heads/main ${yamlHead} refs/heads/main ${tsHead}\n`).stderr)).toBe(1);
+  });
+  // #3630: the hook sees added lines alone, so a Python line added inside an existing """ block has no opener in view;
+  // Dart and Python lines are scanned without their path and still warn.
+  test("a line added inside an existing Python triple-quoted block still warns", () => {
+    fs.writeFileSync(path.join(repo, "settings.py"), 'CONFIG = """\nhost: db\n"""\n');
+    git(["add", "settings.py"]);
+    git(["commit", "-q", "-m", "base"]);
+    const base = git(["rev-parse", "HEAD"]);
+    fs.writeFileSync(path.join(repo, "settings.py"), 'CONFIG = """\nhost: db\npassword: VelvetRiverOrbitSunset\n"""\n');
+    git(["add", "settings.py"]);
+    git(["commit", "-q", "-m", "secret"]);
+    expect(mediums(runHook(`refs/heads/main ${git(["rev-parse", "HEAD"])} refs/heads/main ${base}\n`).stderr)).toBe(1);
+  });
+});
+
+// GST-2195 (GSTA-461 item 5): a file git calls binary printed "Binary files differ" and no added lines, so
+// a token behind a NUL byte, a -diff attribute or UTF-16 text pushed with the hook green.
+describe("files git calls binary are scanned (GST-2195)", () => {
+  test("a token behind a NUL byte, a -diff attribute the push adds, or UTF-16 blocks like plain text", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    const shapes: Array<[string, Record<string, string | Buffer>]> = [
+      ["plain", { "plain.txt": `token ${FAKE_PAT}\n` }],
+      ["nul", { "nul.txt": `\0token ${FAKE_PAT}\n` }],
+      ["-diff", { ".gitattributes": "*.jsonl -diff\n", "out.jsonl": `{"token":"${FAKE_PAT}"}\n` }],
+      ["utf-16le", { "le.txt": utf16(`token ${FAKE_PAT}\r\n`) }],
+      ["utf-16be", { "be.txt": utf16(`token ${FAKE_PAT}\n`, true) }],
+    ];
+    const results = shapes.map(([shape, files]) => {
+      git(["reset", "-q", "--hard", base]);
+      const head = commitFiles(files, shape);
+      const { code, stderr } = runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`);
+      return { shape, code, pat: stderr.includes("github.pat") };
+    });
+    expect(results).toEqual(shapes.map(([shape]) => ({ shape, code: 1, pat: true })));
+  });
+
+  test("a token added to an existing binary file blocks; the bytes already there are not rescanned", () => {
+    const png = fs.readFileSync(path.resolve(import.meta.dir, "..", "extension", "icons", "icon-16.png"));
+    const base = commitFiles({ "icon.png": Buffer.concat([png, Buffer.from(`\n${FAKE_PAT}\n`)]) }, "png with token");
+    const head = commitFiles({ "icon.png": Buffer.concat([png, Buffer.from(`\n${FAKE_PAT}\nmore\n`)]) }, "touch png");
+    expect(runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`).code).toBe(0);
+    const leak = commitFiles({ "icon.png": Buffer.concat([png, Buffer.from(`\n${FAKE_PAT}\nmore\n\0${FAKE_PAT.replace("Zq8", "Yr7")}\n`)]) }, "second token");
+    const { code, stderr } = runHook(`refs/heads/main ${leak} refs/heads/main ${head}\n`);
+    expect({ code, pat: stderr.includes("github.pat") }).toEqual({ code: 1, pat: true });
+  });
+
+  test("an AWS secret key on the line under its keyword blocks in UTF-16LE and UTF-16BE like plain text (GST-2261)", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    const pair = `aws_secret_access_key:\n  ${["Zq3Xn7P2Lm4Rt8Wv", "Bc5Df6Gh7Jk8Lm9Np0Qr1St2"].join("")}\n`;
+    const shapes: Array<[string, string | Buffer]> = [["plain", pair], ["utf-16le", utf16(pair)], ["utf-16be", utf16(pair, true)]];
+    const results = shapes.map(([shape, content]) => {
+      git(["reset", "-q", "--hard", base]);
+      const head = commitFiles({ "creds.yml": content }, shape);
+      const { code, stderr } = runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`);
+      return { shape, code, aws: stderr.includes("aws.secret_key") };
+    });
+    expect(results).toEqual(shapes.map(([shape]) => ({ shape, code: 1, aws: true })));
+  });
+
+  test("a plain token in a binary file that also holds UTF-16 text is listed once (GST-2261)", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    const head = commitFiles({ "mixed.bin": Buffer.concat([Buffer.from(`token ${FAKE_PAT}\n`), utf16("hello world\n")]) }, "mixed binary");
+    const { code, stderr } = runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`);
+    expect({ code, listed: stderr.split("\n").filter((l) => l.includes("github.pat")).length }).toEqual({ code: 1, listed: 1 });
+  });
+
+  test("an allowlisted token in one file whose name git quotes does not hide another token at the same spot in a second such file (GST-2261)", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    const other = ["ghp", "Xv7Nc4Rt9Wy1Kp6Hd3Fs5Gb0Jx8Ue2Zq8Lm2"].join("_");
+    const head = commitFiles({ "café-1.txt": `token: ${FAKE_PAT}\n`, "café-2.txt": `token: ${other}\n`, ".gstack-redact-allowlist": `${FAKE_PAT}\n` }, "quoted names");
+    const { code, stderr } = runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`);
+    git(["reset", "-q", "--hard", base]);
+    expect({ code, blocked: stderr.includes("BLOCKED") }).toEqual({ code: 1, blocked: true });
+  });
+
+  test("a plain-byte AWS key before its UTF-16LE keyword on one line blocks like main (GST-2261)", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    const mixed = Buffer.concat([Buffer.from(`\0x\0${["Zq3Xn7P2Lm4Rt8Wv", "Bc5Df6Gh7Jk8Lm9Np0Qr1St2"].join("")}\0y\0 `, "latin1"), Buffer.from("aws_secret_access_key:", "utf16le"), Buffer.from("\n")]);
+    const head = commitFiles({ "mixed.bin": mixed }, "mixed");
+    const { code, stderr } = runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`);
+    expect({ code, aws: stderr.includes("aws.secret_key") }).toEqual({ code: 1, aws: true });
+  });
+
+  test("deleting a 70 MiB binary pushes clean, and adding one still blocks on the 64 MiB diff limit (GST-2261)", () => {
+    const base = git(["rev-parse", "HEAD"]);
+    const big = commitFiles({ "big.bin": Buffer.alloc(70 * 1024 * 1024) }, "add big binary");
+    const added = runHook(`refs/heads/main ${big} refs/heads/main ${base}\n`);
+    expect({ code: added.code, overflow: added.stderr.includes("killed/overflow") }).toEqual({ code: 1, overflow: true });
+    git(["rm", "-q", "big.bin"]);
+    git(["commit", "-q", "-m", "drop big binary"]);
+    const dropped = git(["rev-parse", "HEAD"]);
+    expect(runHook(`refs/heads/main ${dropped} refs/heads/main ${big}\n`)).toEqual({ code: 0, stderr: "" });
+  });
+
+  test("the real binary assets this repo stores push clean", () => {
+    const root = path.resolve(import.meta.dir, "..");
+    const assets = spawnSync("git", ["ls-files", "--eol"], { cwd: root, encoding: "utf8", timeout: 30_000 }).stdout.split("\n").filter((l) => l.startsWith("i/-text")).map((l) => l.split("\t").pop()!);
+    expect(assets.length).toBeGreaterThanOrEqual(10);
+    const base = git(["rev-parse", "HEAD"]);
+    const head = commitFiles(Object.fromEntries(assets.map((rel) => [rel, fs.readFileSync(path.join(root, rel))])), "assets");
+    const { code, stderr } = runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`);
+    expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
   });
 });

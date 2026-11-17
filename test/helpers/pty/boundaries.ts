@@ -68,7 +68,7 @@ export const engSetupAUQ: Step0BoundaryPredicate = (fp) => {
   return answered.length > 0 && answered.every(q => {
     if (!q.options.some(option => option.label === call.answers?.[q.question])) return false;
     const actions = q.options.map(option => option.label.trim().replace(/^[A-Z][.)]\s+/i, ''));
-    const id = /<gstack-qid:\s*([a-z0-9-]+)\s*>/i.exec(q.question)?.[1]?.toLowerCase();
+    const id = /<gstack-qid:\s*([a-z0-9-]+)(?:;signal=[a-z0-9-]+)?\s*>/i.exec(q.question)?.[1]?.toLowerCase();
     const body = q.question.replace(/<gstack-qid:[^>]*>/gi, '').trim()
       .replace(/^D\s*\d+\s*[—–:-]\s*/i, '');
     // A finding about one component or a TODO remains substantive even if
@@ -234,7 +234,7 @@ function engNumberedFindingAUQ(fp: AskUserQuestionFingerprint): boolean {
   // A declarative severity-labelled issue can own the same cache repair as
   // an interrogative title. Require its native decision, current assessment,
   // and opposed implementation options; metadata alone never opens review.
-  const declaredCache = /^(?:Issue|Finding) ([1-9]\d*) \[P[0-3]\] \(confidence (?:10|[1-9])\/10\) [A-Za-z][\w./-]*:[1-9]\d*(?:-[1-9]\d*)?: ([A-Za-z_$][\w$]*) and ([A-Za-z_$][\w$]*) share a global mutable ([A-Za-z_$][\w$]*) via module-level export, and both mutate it\.$/.exec(title);
+  const declaredCache = /^(?:Issue|Finding) ([1-9]\d*) \[(?:P[0-3]|CRITICAL|INFORMATIONAL)\] \(confidence (?:10|[1-9])\/10\) [A-Za-z][\w./-]*:[1-9]\d*(?:-[1-9]\d*)?: ([A-Za-z_$][\w$]*) and ([A-Za-z_$][\w$]*) share a global mutable ([A-Za-z_$][\w$]*) via module-level export, and both mutate it\.$/.exec(title);
   if (declaredCache) return engDeclaredCacheFinding(q, declaredCache);
   if (engCacheWriterDecision(q)) return true;
   const libraryHooks = engLibraryHooksFinding(q, title);
@@ -592,7 +592,7 @@ export const engFirstReviewAUQ: Step0BoundaryPredicate = (fp) => {
     if (!call.answers?.[q.question]) return false;
     // These are review section identities, including the registry's
     // arch-finding/test-gap IDs. Scope and onboarding IDs cannot qualify.
-    const id = /<gstack-qid:\s*([a-z0-9-]+)\s*>/i.exec(q.question)?.[1] ?? '';
+    const id = /<gstack-qid:\s*([a-z0-9-]+)(?:;signal=[a-z0-9-]+)?\s*>/i.exec(q.question)?.[1] ?? '';
     if (/^plan-eng-(?:review-)?(?:arch(?:itecture)?|quality|test|perf(?:ormance)?)-(?:focus|mode|setup|routing|learnings|prerequisite|onboarding|next-steps?)(?:-|$)/i.test(id)) return false;
     const title = `${q.header} ${q.question.split('\n')[0]}`.replace(/<gstack-qid:[^>]*>/gi, '');
     return /^plan-eng-(?:review-)?(?:arch(?:itecture)?|quality|test|perf(?:ormance)?)-/i.test(id) &&

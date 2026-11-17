@@ -54,6 +54,7 @@ import { atomicWriteSync } from "./fs-atomic";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { buildGbrainEnv, gbrainChildCwd, gbrainConfigDir, isExecTimeout, NEEDS_SHELL_ON_WINDOWS } from "./gbrain-exec";
+import { classifyGbrainMcpEntry } from "./gbrain-mcp-locality";
 import { resolveStateRoot } from "./state-root";
 
 export type LocalEngineStatus =
@@ -133,9 +134,9 @@ export function cacheFilePath(): string {
  * (#2521): GBRAIN_HOME is a parent dir, `.gbrain` is appended. Same
  * resolution as buildGbrainEnv — both route through gbrainConfigDir.
  */
-function gbrainConfigPath(env?: NodeJS.ProcessEnv): string {
-  const e = env ?? process.env;
-  return join(gbrainConfigDir(e), "config.json");
+function gbrainConfigPath(env?: NodeJS.ProcessEnv): string | null {
+  const dir = gbrainConfigDir(env ?? process.env);
+  return dir && join(dir, "config.json");
 }
 
 /**
@@ -187,16 +188,11 @@ export function hasRemoteOnlyGbrainMcp(
   } catch {
     return false;
   }
-  // Same classification rules as gstack-gbrain-detect's detectMcpMode tier 3,
-  // including the #2051 name generalization (gbrain, gbrain-remote, gbrain_work).
-  const classify = (entry: McpEntry): "remote" | "local" | null => {
-    const mtype = entry.type || entry.transport || "";
-    if (mtype === "url" || mtype === "http" || mtype === "sse") return "remote";
-    if (mtype === "stdio") return "local";
-    if (entry.url) return "remote";
-    if (entry.command) return "local";
-    return null;
-  };
+  // The classifier gstack-gbrain-detect's detectMcpMode uses, so a loopback
+  // `gbrain serve --http` over this machine's own engine is local here too
+  // (#3539): detect never prints local-stdio next to thin-client. Name
+  // generalization (#2051: gbrain, gbrain-remote, gbrain_work) is below.
+  const classify = (entry: McpEntry): "remote" | "local" | null => classifyGbrainMcpEntry(entry, env ?? process.env);
   /** Extract the gbrain-relevant entries from an mcpServers object. */
   const gbrainEntries = (servers: unknown): Record<string, McpEntry> => {
     const out: Record<string, McpEntry> = {};
@@ -248,8 +244,10 @@ export function hasRemoteOnlyGbrainMcp(
 }
 
 function configuredEngine(env?: NodeJS.ProcessEnv): "pglite" | "postgres" | null {
+  const configPath = gbrainConfigPath(env);
+  if (!configPath) return null;
   try {
-    const parsed = JSON.parse(readFileSync(gbrainConfigPath(env), "utf-8")) as { engine?: string };
+    const parsed = JSON.parse(readFileSync(configPath, "utf-8")) as { engine?: string };
     return parsed.engine === "pglite" || parsed.engine === "postgres" ? parsed.engine : null;
   } catch {
     return null;
@@ -341,8 +339,10 @@ export function readGbrainVersion(env?: NodeJS.ProcessEnv): string {
 }
 
 function configFingerprint(env?: NodeJS.ProcessEnv): { mtime: number; size: number } {
+  const configPath = gbrainConfigPath(env);
+  if (!configPath) return { mtime: 0, size: 0 };
   try {
-    const st = statSync(gbrainConfigPath(env));
+    const st = statSync(configPath);
     return { mtime: Math.floor(st.mtimeMs), size: st.size };
   } catch {
     return { mtime: 0, size: 0 };
@@ -425,12 +425,15 @@ function networkFailureDetail(stderr: string, env?: NodeJS.ProcessEnv): string |
   const m = stderr.match(NETWORK_ERROR_RE);
   if (!m) return null;
   let host = "";
-  try {
-    const cfg = JSON.parse(readFileSync(join(gbrainConfigDir(env ?? process.env), "config.json"), "utf-8"));
-    if (typeof cfg?.database_url === "string") {
-      host = new URL(cfg.database_url.replace(/^postgres(ql)?:\/\//, "http://")).hostname;
-    }
-  } catch {}
+  const configPath = gbrainConfigPath(env);
+  if (configPath) {
+    try {
+      const cfg = JSON.parse(readFileSync(configPath, "utf-8"));
+      if (typeof cfg?.database_url === "string") {
+        host = new URL(cfg.database_url.replace(/^postgres(ql)?:\/\//, "http://")).hostname;
+      }
+    } catch {}
+  }
   if (!host) host = stderr.match(new RegExp(`${m[1]}\\s+([A-Za-z0-9.-]+)`))?.[1] ?? "";
   return dbUnreachableReason(m[1], host);
 }
@@ -460,7 +463,8 @@ function freshClassify(env?: NodeJS.ProcessEnv): LocalEngineStatus {
   // 2. Config file present? A bearer thin client (#2520) may never have run
   // a local init, so config.json can be absent while the remote-HTTP MCP
   // registration IS the user's brain.
-  if (!existsSync(gbrainConfigPath(env))) {
+  const configPath = gbrainConfigPath(env);
+  if (!configPath || !existsSync(configPath)) {
     return hasRemoteOnlyGbrainMcp(env) ? "thin-client" : "missing-config";
   }
 
@@ -473,7 +477,7 @@ function freshClassify(env?: NodeJS.ProcessEnv): LocalEngineStatus {
   // immune to gbrain error-string drift. Remote reachability is deliberately
   // NOT probed here — a classifier network probe is the #1964 pathology.
   try {
-    const cfg = JSON.parse(readFileSync(gbrainConfigPath(env), "utf-8")) as {
+    const cfg = JSON.parse(readFileSync(configPath, "utf-8")) as {
       remote_mcp?: unknown;
     };
     if (cfg && typeof cfg === "object" && cfg.remote_mcp) {

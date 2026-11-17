@@ -28,6 +28,10 @@ export interface CanonicalFinding {
   user_challenge?: boolean; urgent?: boolean; suggested_owner?: string; plan_items?: string[]; dimension?: string;
   /** What a user challenge changes: scope, cost or direction (plan B2a), or packaging/ordering (settled without a plan edit). */
   changes?: Changes;
+  /** A challenge to the owner's own words: the 1-based bullet of the plan's `### Owner's words` it would change. */
+  owner_quote?: number;
+  /** A confirm round's row naming the earlier challenge id the revised plan now fixes. */
+  resolves?: string;
 }
 export const CHANGES = ['scope', 'cost', 'direction', 'packaging', 'ordering'] as const;
 /** Accepted changes of these kinds need no Implementation-plan edit: `revise --settle` records them. */
@@ -90,6 +94,8 @@ function parseFences(text: string, errors: string[]): { findings: CanonicalFindi
       if (typeof row.suggested_owner === 'string') finding.suggested_owner = row.suggested_owner;
       if (Array.isArray(row.plan_items)) finding.plan_items = row.plan_items.filter((p: unknown): p is string => typeof p === 'string');
       if (typeof row.dimension === 'string') finding.dimension = row.dimension;
+      if (Number.isInteger(row.owner_quote) && row.owner_quote > 0) finding.owner_quote = row.owner_quote;
+      if (typeof row.resolves === 'string' && row.resolves.trim()) finding.resolves = row.resolves.trim();
       if (row.changes !== undefined) {
         if (!(CHANGES as readonly unknown[]).includes(row.changes)) { errors.push(`findings row ${i + 1}: changes ${JSON.stringify(row.changes)} is not one of ${CHANGES.join('|')}`); return; }
         finding.changes = row.changes;
@@ -186,7 +192,7 @@ export function canonicalRows(findings: CanonicalFinding[], ctx: { run: string; 
     ...(f.local_id ? { source: f.local_id } : {}),
     ...(f.user_challenge ? { user_challenge: true } : {}), ...(f.urgent ? { urgent: true } : {}),
     ...(f.suggested_owner ? { suggested_owner: f.suggested_owner } : {}), ...(f.dimension ? { dimension: f.dimension } : {}),
-    ...(f.changes ? { changes: f.changes } : {}),
+    ...(f.changes ? { changes: f.changes } : {}), ...(f.owner_quote ? { owner_quote: f.owner_quote } : {}), ...(f.resolves ? { resolves: f.resolves } : {}),
   } as FindingRow));
 }
 
@@ -196,20 +202,30 @@ export interface ReconciliationRow {
   outside_id: string; native_id: string | null; disposition: ReconciliationDisposition;
   /** Why this disposition: the matched location or title, or the parent's override reason. */
   resolution: string;
-  basis: 'file_line' | 'title' | 'override' | 'none';
+  basis: 'file_line' | 'file' | 'title' | 'override' | 'none';
   severity: { outside: Severity; native: Severity | null };
   /** A parent override's one shared proposal for both voices' user challenge; the gate renders it as option b. */
   proposal?: string;
 }
 export interface ReconciliationOverride { outside_id: string; native_id?: string | null; disposition: ReconciliationDisposition; resolution: string; proposal?: string }
 
-export const tokens = (title: string) => new Set(title.toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').split(/\s+/).filter(t => t.length > 2));
+/** A DX cap code (`CAP4:<path>:<item>`) names a location, not the problem, so title comparison skips it. */
+export const tokens = (title: string) => new Set(title.replace(/^\s*CAP[46]\s*:[^:]*:\s*/i, '').toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').split(/\s+/).filter(t => t.length > 2));
 export function jaccard(a: Set<string>, b: Set<string>): number {
   if (!a.size || !b.size) return 0;
   let inter = 0;
   for (const t of a) if (b.has(t)) inter++;
   return inter / (a.size + b.size - inter);
 }
+const capPath = (title: string) => /^\s*CAP[46]\s*:([^:]*):/i.exec(title)?.[1]!.trim();
+/** Title similarity. Two CAP-coded titles on different paths name different problems, so they never match. */
+export function titleScore(a: string, b: string): number {
+  const pa = capPath(a), pb = capPath(b);
+  if (pa !== undefined && pb !== undefined && pa !== pb) return 0;
+  return jaccard(tokens(a), tokens(b));
+}
+/** The voices name one problem: a title association or the parent's override. A shared location (file, or file:line with unrelated titles) associates two findings but never makes them one. */
+export const sameProblem = (r: ReconciliationRow) => !!r.native_id && (r.basis === 'title' || r.basis === 'override' || (r.basis === 'file_line' && !r.resolution.startsWith('same location')));
 const level = (s: Severity) => SEVERITIES.indexOf(s);
 /** A remedy compared as words: case, punctuation and spacing ignored. */
 export const remedyKey = (text: string | undefined) => (text ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
@@ -225,7 +241,9 @@ function contradictory(a: string, b: string): boolean {
 
 /**
  * Structural reconciliation. Findings associate by a title overlap of at least
- * half the words, or by file:line (±3 lines). Association alone never
+ * half the words (a leading CAP code ignored; never across two different files),
+ * or by file:line (±3 lines), or, when either finding has no line, by the same
+ * file. Association alone never
  * confirms: a title association is `confirmed` only when both voices state the
  * same remedy, `disagree` when severities differ by two or more levels or the
  * remedies contradict (one keeps, drops or negates what the other changes),
@@ -250,6 +268,8 @@ export function reconcile(native: FindingRow[], outside: FindingRow[], overrides
   }
   const used = new Set<string>();
   const rows: ReconciliationRow[] = [];
+  const later: Array<[number, FindingRow]> = [];
+  const unmatched = (o: FindingRow): ReconciliationRow => ({ outside_id: o.id, native_id: null, disposition: 'new', resolution: 'not raised by the native voice', basis: 'none', severity: { outside: o.severity, native: null } });
   for (const o of outside) {
     const override = byOutside.get(o.id);
     if (override) {
@@ -260,17 +280,17 @@ export function reconcile(native: FindingRow[], outside: FindingRow[], overrides
       continue;
     }
     const near = (n: FindingRow) => !!o.file && o.line !== undefined && n.file === o.file && n.line !== undefined && Math.abs(n.line - o.line) <= 3;
-    const ot = tokens(o.title);
     let match: FindingRow | undefined;
     let best = 0;
     for (const n of native) {
-      if (used.has(n.id)) continue;
-      const score = jaccard(ot, tokens(n.title)) + (near(n) ? 0.01 : 0);
+      if (used.has(n.id) || (o.file && n.file && o.file !== n.file)) continue;
+      const score = titleScore(o.title, n.title) + (near(n) ? 0.01 : 0);
       if (score >= 0.5 && score > best) { best = score; match = n; }
     }
     const titled = !!match;
     match ??= native.find(n => !used.has(n.id) && near(n));
-    if (!match) { rows.push({ outside_id: o.id, native_id: null, disposition: 'new', resolution: 'not raised by the native voice', basis: 'none', severity: { outside: o.severity, native: null } }); continue; }
+    if (!match && o.file) { later.push([rows.length, o]); rows.push(unmatched(o)); continue; }
+    if (!match) { rows.push(unmatched(o)); continue; }
     used.add(match.id);
     const basis: ReconciliationRow['basis'] = near(match) ? 'file_line' : 'title';
     const where = near(match) ? `${o.file}:${o.line}` : 'same title';
@@ -285,6 +305,14 @@ export function reconcile(native: FindingRow[], outside: FindingRow[], overrides
     if (contradictory(match.resolution, o.resolution)) { pair('disagree', `remedies conflict (${where}): native "${match.resolution}", outside "${o.resolution}"`); continue; }
     if (remedyKey(match.resolution) !== remedyKey(o.resolution)) { pair('unverified', `same title, remedies differ (${where}): ${match.title}`); continue; }
     pair('confirmed', `both voices, same remedy (${where}): ${match.title}`);
+  }
+  // Plan reviews name a file without a line: same file, a line missing on either side, once every title and line match is placed.
+  for (const [i, o] of later) {
+    const match = native.filter(n => !used.has(n.id) && n.file === o.file && (o.line === undefined || n.line === undefined))
+      .reduce<FindingRow | undefined>((b, n) => (!b || titleScore(o.title, n.title) > titleScore(o.title, b.title) ? n : b), undefined);
+    if (!match) continue;
+    used.add(match.id);
+    rows[i] = { outside_id: o.id, native_id: match.id, disposition: 'unverified', resolution: `same file, agreement unverified (${o.file}): ${match.title}`, basis: 'file', severity: { outside: o.severity, native: match.severity } };
   }
   return { rows, native_only: native.filter(n => !used.has(n.id)).map(n => n.id), errors };
 }

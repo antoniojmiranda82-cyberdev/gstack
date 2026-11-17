@@ -23,6 +23,7 @@ import {
 } from './helpers/e2e-helpers';
 import { extractSkillBody } from './helpers/skill-fixture';
 import { readShippedSkillRouting } from './helpers/shipped-skill-routing';
+import { fragmentRestoreVerdict } from './helpers/context-restore-fragment';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -71,6 +72,9 @@ function setupWorkdir(suffix: string): { workDir: string; gstackHome: string; sl
       fs.chmodSync(path.join(binDir, script), 0o755);
     }
   }
+  // gstack-timeline-log and gstack-learnings-log import ../lib/redact-engine.ts
+  // from beside bin/. A copy, not a symlink: the agent runs inside workDir.
+  fs.cpSync(path.join(ROOT, 'lib'), path.join(workDir, 'lib'), { recursive: true });
 
   // Routing CLAUDE.md: the ## Skill routing section gstack ships.
   fs.writeFileSync(path.join(workDir, 'CLAUDE.md'), `# Project Instructions
@@ -260,11 +264,14 @@ Do NOT use AskUserQuestion.`,
 
     logCost('context-restore-fragment-match', result);
 
-    // Broader surface — agent may stop at Skill call without echoing the
-    // body marker. The payments file's body is in tool outputs (Read/Bash).
-    const out = fullOutputSurface(result);
-    const loadedPayments = out.includes('FRAGMATCH_PAYMENTS_BUILD');
-    const didNotLoadOthers = !out.includes('FRAGMATCH_ALPHA_BUILD') && !out.includes('FRAGMATCH_OMEGA_BUILD');
+    // What was restored is what the agent reports, not what its tools printed:
+    // finding the matching title can cat every checkpoint, so all three bodies
+    // may appear in Bash/Read output. The report must carry the payments body
+    // and no other checkpoint's body.
+    const { loadedTarget: loadedPayments, didNotLoadOthers } = fragmentRestoreVerdict(result, {
+      restored: 'FRAGMATCH_PAYMENTS_BUILD',
+      others: ['FRAGMATCH_ALPHA_BUILD', 'FRAGMATCH_OMEGA_BUILD'],
+    });
     const routedToRestore = skillCalls(result).includes('context-restore');
     const exitOk = ['success', 'error_max_turns'].includes(result.exitReason);
 

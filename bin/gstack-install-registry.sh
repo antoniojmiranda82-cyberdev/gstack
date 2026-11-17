@@ -23,21 +23,25 @@
 #   render       render directory, or 'committed'
 #
 # Callers must set GSTACK_STATE_ROOT first (bin/gstack-state-root.sh). Bash 3.2
-# clean; no flock (macOS lacks it), so the lock is an atomic mkdir.
+# clean; no flock (macOS lacks it), so the lock is gstack_lock_take
+# (bin/gstack-lock.sh).
 
 # Same-path and containment checks (bin/gstack-path-spelling.sh).
 . "$(dirname "${BASH_SOURCE[0]}")/gstack-path-spelling.sh" 2>/dev/null || true
+. "$(dirname "${BASH_SOURCE[0]}")/gstack-lock.sh" 2>/dev/null || gstack_lock_take() { echo "gstack: $(dirname "${BASH_SOURCE[0]}")/gstack-lock.sh is missing; reinstall with ./setup" >&2; return 2; }
 
 # gstack_install_move_hint SRC HOST — when HOST's runtime root ROOT is SRC (the
 # checkout) or contains it, `./setup --host HOST` would replace the checkout
 # (#3084): print the commands that move it out first and return 0. A symlinked
 # ~/.claude/skills/gstack that points at SRC becomes the checkout itself.
 # Kiro writes its runtime files into ROOT in place, which would link the
-# checkout into itself, so it counts too. Claude installs in place from the
-# checkout, and a ROOT that is a symlink is replaced as a link: those return 1.
+# checkout into itself, so it counts too. Claude and the harness hosts
+# (OpenClaw, Hermes: gstack-harness copies skills that call the checkout) run
+# in place from the checkout, and a ROOT that is a symlink is replaced as a
+# link: those return 1.
 gstack_install_move_hint() {
   local src="$1" host="$2" root="$3" claude_link="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/gstack"
-  [ "$host" = claude ] && return 1
+  case "$host" in claude|openclaw|hermes) return 1 ;; esac
   [ -L "$root" ] && return 1
   command -v gstack_path_within >/dev/null 2>&1 && gstack_path_within "$src" "$root" || return 1
   if [ -L "$claude_link" ] && gstack_path_same "$claude_link" "$src"; then
@@ -51,15 +55,17 @@ gstack_install_registry_file() {
   printf '%s/installs.tsv\n' "${GSTACK_STATE_ROOT:?gstack-install-registry: GSTACK_STATE_ROOT is not set}"
 }
 
-# _gstack_registry_lock — take the registry lock (mkdir is atomic). A lock whose
-# owner pid is gone is stale and is broken. Gives up after ~10 s.
+# _gstack_registry_lock — take the registry lock (gstack_lock_take, which
+# creates the pid file with O_EXCL; mkdir's exit status is not a lock on Ubuntu
+# 26.04's uutils mkdir). A lock whose owner pid is gone is stale and is broken.
+# Gives up after ~10 s.
 _gstack_registry_lock() {
   local file lock tries owner
   file="$(gstack_install_registry_file)" || return 1
   lock="$file.lock"
   mkdir -p "$(dirname "$file")" || return 1
   tries=0
-  while ! mkdir "$lock" 2>/dev/null; do
+  while ! gstack_lock_take "$lock" pid "$$"; do
     owner="$(cat "$lock/pid" 2>/dev/null || true)"
     if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
       rm -rf "$lock"
@@ -72,7 +78,6 @@ _gstack_registry_lock() {
     fi
     sleep 0.1
   done
-  echo "$$" > "$lock/pid"
 }
 
 _gstack_registry_unlock() {
@@ -182,8 +187,8 @@ gstack_install_render_for() {
 gstack_host_tier() {
   case "$1" in
     claude) echo full ;;
-    codex|kiro|factory|opencode|cursor|copilot|agy) echo experimental ;;
-    slate|openclaw|hermes|gbrain) echo instruction-only ;;
+    codex|kiro|factory|opencode|cursor|copilot|agy|gemini|openclaw|hermes) echo experimental ;;
+    slate|gbrain) echo instruction-only ;;
     *) echo unknown ;;
   esac
 }
@@ -254,6 +259,7 @@ gstack_install_known_roots() {
   printf 'cursor\tglobal\t%s\t%s\n' "$HOME/.cursor/skills" "$HOME/.cursor/skills/gstack"
   printf 'copilot\tglobal\t%s\t%s\n' "$HOME/.copilot/skills" "$HOME/.copilot/skills/gstack"
   printf 'agy\tglobal\t%s\t%s\n' "$HOME/.gemini/antigravity-cli/skills" "$HOME/.gemini/antigravity-cli/skills/gstack"
+  printf 'gemini\tglobal\t%s\t%s\n' "$HOME/.gemini/skills" "$HOME/.gemini/skills/gstack"
   proj="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   if [ -n "$proj" ] && [ "$proj" != "$HOME" ]; then
     printf 'claude\tproject\t%s\t%s\n' "$proj/.claude/skills" "$proj/.claude/skills/gstack"
@@ -336,3 +342,28 @@ gstack_disabled_normalize() {
   done
   printf '%s' "$out"
 }
+
+# GSTACK_RETIRED_SKILLS — skills gstack keeps off every host whatever
+# disabled_skills says; an existing gstack-owned entry is removed like a
+# disabled one. investigate's source is gone (GST-1717), and its old entries
+# are still removed. Same list as RETIRED_SKILLS in scripts/discover-skills.ts
+# (test/retired-skills.test.ts).
+GSTACK_RETIRED_SKILLS="investigate"
+
+# GSTACK_CREW_SKILLS — the gstack-on-Capy skills (crew/README.md). Only a Capy
+# machine registers them; anywhere else they get no entry on any host and an
+# existing gstack-owned entry is removed, like a retired skill. Same list as
+# CREW_SKILLS in scripts/discover-skills.ts (test/crew-skills-on-capy.test.ts).
+GSTACK_CREW_SKILLS="captain"
+
+# gstack_on_capy — true wherever Capy has run: CAPY_MACHINE_CONFIG set (cloud
+# machines), or any ~/.capy entry. A paired device (a Mac running Capy) has no
+# CAPY_MACHINE_CONFIG but has ~/.capy/system and ~/.capy/device. Any ~/.capy
+# counts, so an unclear case installs the crew skills rather than dropping
+# /captain for a Capy user.
+gstack_on_capy() { [ -n "${CAPY_MACHINE_CONFIG:-}" ] || [ -e "${HOME:-/nonexistent}/.capy" ]; }
+
+# GSTACK_UNREGISTERED_SKILLS — what setup and gstack-relink keep off every host
+# on this machine: the retired skills, plus the crew skills off Capy.
+GSTACK_UNREGISTERED_SKILLS="$GSTACK_RETIRED_SKILLS"
+gstack_on_capy || GSTACK_UNREGISTERED_SKILLS="$GSTACK_RETIRED_SKILLS $GSTACK_CREW_SKILLS"

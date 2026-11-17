@@ -80,7 +80,9 @@ function stagePieces(stage: string[], scope: ShellScope, alone: boolean): Piece[
   if (!name || (discarded && name === 'echo')) return undefined;
   // Backslashes are data only in these closed grep/awk display patterns.
   const grepRange = /^grep\s+-n(?:\s+-i)?(?:\s+-B\d{1,4})?(?:\s+-A\d{1,4})?\s+(?:"(?:[^"\\$`]|\\[|.])*"|'(?:[^'\\$`]|\\[|.])*')\s+(.+)$/.exec(text);
-  const displayGrep = Boolean(grepRange && literal(grepRange[1]!) && !literal(grepRange[1]!)!.startsWith('-'));
+  // One or more literal file operands (the tokens after the quoted pattern), none of them an option.
+  const grepOperands = grepRange ? words.slice(words.findIndex((word, index) => index > 0 && /^["']/.test(word)) + 1) : [];
+  const displayGrep = grepOperands.length > 0 && grepOperands.every(operand => literal(operand) !== undefined && !literal(operand)!.startsWith('-'));
   const awkRange = /^awk\s+'\/(?:[^/\\]|\\[./|])*\/,\/(?:[^/\\]|\\[./|])*\/'\s+(.+)$/.exec(text)
     ?? /^awk\s+'\/(?:[^/\\]|\\[./|])*\/\{f=1\} f&&\/(?:[^/\\]|\\[./|])*\/\{exit\} f'\s+(.+)$/.exec(text);
   const displayAwk = Boolean(awkRange && literal(awkRange[1]!) && !literal(awkRange[1]!)!.startsWith('-'));
@@ -138,8 +140,8 @@ function stagePieces(stage: string[], scope: ShellScope, alone: boolean): Piece[
   }
   if (name === 'grep' || name === 'ls') return [unknown()];
   if (text === 'pwd' || text === 'wc -l') return [unknown(1, 1)];
-  if (name === 'wc' && args[0] === '-l' && args.length > 1) {
-    // One count line per literal in-cwd file, plus a total for several.
+  if (name === 'wc' && (args[0] === '-l' || args[0] === '-c') && args.length > 1) {
+    // One line or byte count line per literal in-cwd file, plus a total for several.
     if (args.slice(1).some(operand => !scopedFile(operand, scope))) return undefined;
     const lines = args.length - 1 + (args.length > 2 ? 1 : 0);
     return [unknown(lines, lines)];
@@ -224,8 +226,30 @@ function matchRun(run: Exclude<Piece, { kind: 'unknown' }>[], out: string, offse
  * credit. Every later run must still appear in order.
  */
 function shellReads(command: unknown, output: unknown, scope: ShellScope): Set<string> {
+  const credited = pieceReads(commandPieces(command, scope), output, false);
+  const abort = credited.size ? undefined : equalsAbort(command, scope);
+  return abort ? pieceReads(abort, output, true) : credited;
+}
+
+/**
+ * zsh expands an unquoted word that starts with = into a command path (EQUALS).
+ * A failed lookup prints `(eval):1: <name> not found` and abandons the rest of
+ * the line (census 43575953190: `cat -n src; echo ====; cat -n test; git status`
+ * printed the source, then that error). For a standalone `echo =...` after ; or
+ * &&, the expected output is the closed prefix's pieces and that one error line,
+ * ending the output; nothing after the echo ran, so it needs no grammar.
+ */
+function equalsAbort(command: unknown, scope: ShellScope): Piece[] | undefined {
+  const words = shellWords(command);
+  const at = words?.findIndex(word => word.startsWith('=')) ?? -1;
+  if (!words || at < 2 || !/^=[=A-Za-z0-9_.-]+$/.test(words[at]!) || words[at - 1] !== 'echo' ||
+      ![';', '&&'].includes(words[at - 2]!) || ![undefined, ';', '&&'].includes(words[at + 1])) return undefined;
+  const pieces = commandPieces(words.slice(0, at - 2).join(' '), scope);
+  return pieces && [...pieces, { kind: 'label', text: `(eval):1: ${words[at]!.slice(1)} not found` }];
+}
+
+function pieceReads(pieces: Piece[] | undefined, output: unknown, whole: boolean): Set<string> {
   const credited = new Set<string>();
-  const pieces = commandPieces(command, scope);
   const text = outputText(output).replace(/\r\n?/g, '\n');
   if (!pieces || text.length > 4 * 1024 * 1024) return credited;
   // Native Bash results are trimmed: leading blank lines of the first run and
@@ -289,7 +313,7 @@ function shellReads(command: unknown, output: unknown, scope: ShellScope): Set<s
     matched.credited.forEach(file => credited.add(file));
     cursor = matched.end; min = max = 0; pending = false;
   }
-  return credited;
+  return whole && (pending || !/^\n*$/.test(out.slice(cursor))) ? new Set() : credited;
 }
 
 function delivered(output: unknown, expected: string): boolean {

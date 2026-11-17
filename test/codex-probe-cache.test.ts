@@ -74,13 +74,14 @@ describe('bounded multi-signature probe cache', () => {
     expect(fs.realpathSync(lock).startsWith(`${fs.realpathSync(f.home)}${path.sep}`)).toBe(true);
     fs.writeFileSync(path.join(lock, 'owner'), `${process.pid} ${os.hostname()} ${Math.floor(Date.now() / 1000)}\n`);
     fs.writeFileSync(once, 'armed');
-    fs.writeFileSync(path.join(f.home, 'bin/mkdir'), `#!/usr/bin/env bash
-if [ "$#" -eq 1 ] && [ "$1" = "$RACE_LOCK" ] && [ -f "$RACE_ONCE" ]; then
+    // The holder releases right after the writer's take failed: gstack_lock_take never runs mkdir on a held
+    // lock, so the release lands on the writer's first wait instead of inside a failed mkdir.
+    fs.writeFileSync(path.join(f.home, 'bin/sleep'), `#!/usr/bin/env bash
+if [ -f "$RACE_ONCE" ]; then
   rm -f "$RACE_ONCE" "$RACE_LOCK/owner"
   rmdir "$RACE_LOCK"
-  exit 1
 fi
-exec ${JSON.stringify(Bun.which('mkdir'))} "$@"
+exec ${JSON.stringify(Bun.which('sleep'))} "$@"
 `, { mode: 0o755 });
     const result = probe(f, { ...model('gpt-race'), STUB_MODE: 'quota', RACE_LOCK: lock, RACE_ONCE: once });
     expect(result.stdout).toContain('rc=4');
@@ -245,6 +246,31 @@ describe('probe lock recovery and failure', () => {
     fs.utimesSync(lock, old, old);
     expect(probe(f, { _GSTACK_CODEX_LOCK_WAIT: '2' }).stdout).toContain('MODEL_OK\n');
     expect(calls(f)).toBe(1);
+  }));
+
+  test('a lock released while a waiter reads its age is not abandoned; the next owner\'s fresh lock survives', withFixture((f) => {
+    const sig = sigOf(f);
+    const lock = path.join(f.locks, sig);
+    const once = path.join(f.home, 'vanish-once');
+    const real = JSON.stringify(Bun.which('stat'));
+    fs.mkdirSync(lock, { recursive: true });
+    fs.writeFileSync(path.join(f.home, 'bin/stat'), `#!/usr/bin/env bash
+if [ "$3" = "$RACE_LOCK" ] && [ -f "$RACE_ONCE" ]; then
+  case "$1" in
+    -c) rmdir "$RACE_LOCK"; [ "$RACE_PHASE" = early ] && mkdir "$RACE_LOCK"; exit 1 ;;
+    -f) ${real} "$@"; rc=$?; rm -f "$RACE_ONCE"; [ -d "$RACE_LOCK" ] || mkdir "$RACE_LOCK"; exit "$rc" ;;
+  esac
+fi
+exec ${real} "$@"
+`, { mode: 0o755 });
+    for (const phase of ['early', 'late']) {
+      fs.writeFileSync(once, 'armed');
+      const r = probe(f, { _GSTACK_CODEX_LOCK_WAIT: '1', RACE_LOCK: lock, RACE_ONCE: once, RACE_PHASE: phase });
+      expect(fs.existsSync(once)).toBe(false);
+      expect(r.stdout).toContain('MODEL_PROBE_INCONCLUSIVE (another probe of this model still holds its lock)');
+      expect(fs.existsSync(lock)).toBe(true);
+      expect(calls(f)).toBe(0);
+    }
   }));
 
   test('an unreadable cache or uncreatable lock is unverified and launches no paid probe', withFixture((f) => {

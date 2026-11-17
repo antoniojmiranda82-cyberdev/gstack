@@ -47,8 +47,10 @@
 # treated as an owned legacy stray.
 #
 # Mutation safety:
-#   - every mutation runs under a mkdir lock (<settings>.lock/) with an owner
-#     token; release is ownership-checked; stale locks (>30s) are taken over
+#   - every mutation runs under a lock directory (<settings>.lock/) whose owner
+#     token file is created with O_EXCL (gstack_lock_take, bin/gstack-lock.sh;
+#     mkdir's exit status is not a lock on Ubuntu 26.04's uutils mkdir);
+#     release is ownership-checked; stale locks (>30s) are taken over
 #     via atomic rename. On lock give-up the mutation is SKIPPED with a warning
 #     (the next setup retries — the system is convergent).
 #   - parse failure fails CLOSED: a corrupt settings.json is never overwritten
@@ -69,6 +71,7 @@
 BASH_COMPAT=50
 
 set -euo pipefail
+GSTACK_BUN_CONFIG=/dev/null; case "${OSTYPE:-}" in msys*|cygwin*) if command -v cygpath >/dev/null 2>&1; then GSTACK_BUN_CONFIG=NUL; fi ;; esac
 
 ACTION="${1:-}"
 SETTINGS_FILE="${GSTACK_SETTINGS_FILE:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json}"
@@ -126,7 +129,17 @@ var KNOWN_HOOKS = {
   "timeline-stop-hook":       { source: "gstack-timeline-stop", event: "Stop",        matcher: "", relpath: "hosts/claude/hooks/timeline-stop-hook" },
   "memorable-user-prompt-hook": { source: "gstack-memorable", event: "UserPromptSubmit", matcher: "", relpath: "hosts/claude/hooks/memorable-user-prompt-hook" },
   "gstack-session-update":    { source: "gstack-session-update", event: "SessionStart", matcher: "", relpath: "bin/gstack-session-update" },
-  "gstack-verify-gate":       { source: "verify-gate", event: "Stop", matcher: "", relpath: "bin/gstack-verify-gate" }
+  "gstack-verify-gate":       { source: "verify-gate", event: "Stop", matcher: "", relpath: "bin/gstack-verify-gate" },
+  "skill-route-hook":         { source: "gstack-skill-route", event: "UserPromptSubmit", matcher: "", relpath: "hosts/claude/hooks/skill-route-hook" },
+  "skill-contract-stop-hook": { source: "gstack-skill-contract", event: "Stop", matcher: "", relpath: "hosts/claude/hooks/skill-contract-stop-hook" },
+  "investigate-gate-pre":     { source: "gstack-investigate-gate", event: "PreToolUse", matcher: "Edit|Write|MultiEdit|NotebookEdit|Bash", relpath: "hosts/claude/hooks/investigate-gate-pre" },
+  "investigate-gate-post":    { source: "gstack-investigate-gate", event: "PostToolUse", matcher: "Bash", relpath: "hosts/claude/hooks/investigate-gate-post" },
+  "investigate-gate-post-failure": { source: "gstack-investigate-gate", event: "PostToolUseFailure", matcher: "Bash", relpath: "hosts/claude/hooks/investigate-gate-post-failure" },
+  "investigate-gate-stop":    { source: "gstack-investigate-gate", event: "Stop", matcher: "", relpath: "hosts/claude/hooks/investigate-gate-stop" },
+  "ceo-review-gate-stop":     { source: "gstack-ceo-review-gate", event: "Stop", matcher: "", relpath: "hosts/claude/hooks/ceo-review-gate-stop" },
+  "ceo-review-gate-subagent-stop": { source: "gstack-ceo-review-gate", event: "SubagentStop", matcher: "", relpath: "hosts/claude/hooks/ceo-review-gate-subagent-stop" },
+  "autoplan-stop-gate-stop":  { source: "gstack-autoplan-gate", event: "Stop", matcher: "", relpath: "hosts/claude/hooks/autoplan-stop-gate-stop" },
+  "autoplan-stop-gate-publish": { source: "gstack-autoplan-gate", event: "PreToolUse", matcher: "Bash", relpath: "hosts/claude/hooks/autoplan-stop-gate-publish" }
 };
 function gsHadBashPrefix(c) { return String(c == null ? "" : c).trim().indexOf("bash ") === 0; }
 function gsStripWrap(c) {
@@ -307,7 +320,7 @@ function gsWriteIfChanged(path, beforeText, settings, existed) {
 
 GSTACK_SETTINGS_INPUT="$SETTINGS_FILE"
 export GSTACK_SETTINGS_INPUT
-SETTINGS_FILE=$(bun --no-env-file --config=/dev/null -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
+SETTINGS_FILE=$(bun --no-env-file --config="${GSTACK_BUN_CONFIG:-/dev/null}" -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
   process.stdout.write(gsResolveSettingsPath(process.env.GSTACK_SETTINGS_INPUT));
 });') || exit $?
 
@@ -342,18 +355,18 @@ _acquire_lock() {
   local stale_after_s=30   # lock older than this belongs to a crashed holder
   local poll_ms=50         # retry cadence; sleep below derives from this
   token="$$-$RANDOM$RANDOM"
+  . "$(cd "$(dirname "$0")" && pwd)/gstack-lock.sh" 2>/dev/null || { echo "gstack-settings-hook: $(dirname "$0")/gstack-lock.sh is missing -- skipping this mutation, exit 5 (fix: reinstall with ./setup)" >&2; return 1; }
   while :; do
-    if mkdir "$_LOCK_DIR" 2>/dev/null; then
-      printf '%s\n' "$token" > "$_LOCK_DIR/owner" 2>/dev/null || true
+    if gstack_lock_take "$_LOCK_DIR" owner "$token"; then
       _LOCK_TOKEN="$token"
       trap _release_lock EXIT
       trap 'exit 129' INT
       trap 'exit 143' TERM
       return 0
     fi
-    # mkdir failed but no lock dir exists: either a holder released between
-    # our mkdir and this check, or NOT contention (unwritable parent, read-only
-    # fs, missing directory). Retry mkdir once; a second failure with still no
+    # The take failed but no lock dir exists: either a holder released between
+    # our take and this check, or NOT contention (unwritable parent, read-only
+    # fs, missing directory). Retry the take once; a second failure with still no
     # lock dir is the environment, and waiting cannot help, so give up loudly
     # now instead of spinning out the full timeout.
     if [ ! -e "$_LOCK_DIR" ]; then
@@ -405,7 +418,7 @@ case "$ACTION" in
     fi
     _acquire_lock || exit 5
     _mutation_env
-    GSTACK_SETTINGS_PATH="$SETTINGS_FILE" GSTACK_HOOK_CMD="$HOOK_CMD" bun --no-env-file --config=/dev/null -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
+    GSTACK_SETTINGS_PATH="$SETTINGS_FILE" GSTACK_HOOK_CMD="$HOOK_CMD" bun --no-env-file --config="${GSTACK_BUN_CONFIG:-/dev/null}" -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
       const settingsPath = process.env.GSTACK_SETTINGS_PATH;
       const hookCmd = process.env.GSTACK_HOOK_CMD;
       const loaded = gsLoadSettings(settingsPath);
@@ -435,7 +448,7 @@ case "$ACTION" in
     [ -f "$SETTINGS_FILE" ] || exit 1
     _acquire_lock || exit 5
     _mutation_env
-    GSTACK_SETTINGS_PATH="$SETTINGS_FILE" bun --no-env-file --config=/dev/null -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
+    GSTACK_SETTINGS_PATH="$SETTINGS_FILE" bun --no-env-file --config="${GSTACK_BUN_CONFIG:-/dev/null}" -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
       const settingsPath = process.env.GSTACK_SETTINGS_PATH;
       const loaded = gsLoadSettings(settingsPath);
       const settings = loaded.settings;
@@ -485,8 +498,8 @@ case "$ACTION" in
       exit 1
     fi
     case "$EVENT" in
-      SessionStart|PreToolUse|PostToolUse|UserPromptSubmit|Stop|Notification) ;;
-      *) echo "invalid --event '$EVENT'; must be one of SessionStart|PreToolUse|PostToolUse|UserPromptSubmit|Stop|Notification" >&2; exit 1 ;;
+      SessionStart|PreToolUse|PostToolUse|PostToolUseFailure|UserPromptSubmit|Stop|SubagentStop|Notification) ;;
+      *) echo "invalid --event '$EVENT'; must be one of SessionStart|PreToolUse|PostToolUse|PostToolUseFailure|UserPromptSubmit|Stop|SubagentStop|Notification" >&2; exit 1 ;;
     esac
     DIFF_ONLY=""
     ENSURE=""
@@ -505,7 +518,7 @@ case "$ACTION" in
     GSTACK_TIMEOUT="$TIMEOUT" \
     GSTACK_DIFF_ONLY="$DIFF_ONLY" \
     GSTACK_ENSURE="$ENSURE" \
-    bun --no-env-file --config=/dev/null -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
+    bun --no-env-file --config="${GSTACK_BUN_CONFIG:-/dev/null}" -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
       const settingsPath = process.env.GSTACK_SETTINGS_PATH;
       const event = process.env.GSTACK_EVENT;
       const cmd = process.env.GSTACK_COMMAND;
@@ -660,7 +673,7 @@ case "$ACTION" in
     [ -f "$SETTINGS_FILE" ] || exit 0
     _acquire_lock || exit 5
     _mutation_env
-    GSTACK_SETTINGS_PATH="$SETTINGS_FILE" GSTACK_SOURCE="$SOURCE" GSTACK_RS_EVENT="$RS_EVENT" bun --no-env-file --config=/dev/null -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
+    GSTACK_SETTINGS_PATH="$SETTINGS_FILE" GSTACK_SOURCE="$SOURCE" GSTACK_RS_EVENT="$RS_EVENT" bun --no-env-file --config="${GSTACK_BUN_CONFIG:-/dev/null}" -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
       const settingsPath = process.env.GSTACK_SETTINGS_PATH;
       const source = process.env.GSTACK_SOURCE;
       const onlyEvent = process.env.GSTACK_RS_EVENT || "";
@@ -763,7 +776,7 @@ case "$ACTION" in
     GSTACK_PRUNE_ALL="$PRUNE_ALL" \
     GSTACK_PT_OPTOUT="$GSTACK_PT_OPTOUT" \
     GSTACK_SWEEP_EXCLUDE_SOURCES="${GSTACK_SWEEP_EXCLUDE_SOURCES:-}" \
-    bun --no-env-file --config=/dev/null -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
+    bun --no-env-file --config="${GSTACK_BUN_CONFIG:-/dev/null}" -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
       const settingsPath = process.env.GSTACK_SETTINGS_PATH;
       const root = (process.env.GSTACK_REPOINT_ROOT || "").replace(/\/+$/, "");
       const all = process.env.GSTACK_PRUNE_ALL === "1";
@@ -902,7 +915,7 @@ case "$ACTION" in
     fi
     _mutation_env
     GSTACK_SETTINGS_PATH="$SETTINGS_FILE" GSTACK_RESTORE_PATH="$LATEST" \
-    bun --no-env-file --config=/dev/null -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
+    bun --no-env-file --config="${GSTACK_BUN_CONFIG:-/dev/null}" -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
       var fs = require("fs");
       var target = process.env.GSTACK_SETTINGS_PATH;
       var backup = process.env.GSTACK_RESTORE_PATH;
@@ -944,7 +957,7 @@ case "$ACTION" in
       exit 1
     fi
     [ -f "$SETTINGS_FILE" ] || exit 0
-    GSTACK_SETTINGS_PATH="$SETTINGS_FILE" GSTACK_LI_EVENT="$LI_EVENT" GSTACK_LI_OWNED_BY="$LI_OWNED_BY" GSTACK_LI_CMD_RE="$LI_CMD_RE" bun --no-env-file --config=/dev/null -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
+    GSTACK_SETTINGS_PATH="$SETTINGS_FILE" GSTACK_LI_EVENT="$LI_EVENT" GSTACK_LI_OWNED_BY="$LI_OWNED_BY" GSTACK_LI_CMD_RE="$LI_CMD_RE" bun --no-env-file --config="${GSTACK_BUN_CONFIG:-/dev/null}" -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
       const event = process.env.GSTACK_LI_EVENT;
       const ownedBy = process.env.GSTACK_LI_OWNED_BY || "";
       const reSrc = process.env.GSTACK_LI_CMD_RE || "";
@@ -982,7 +995,7 @@ case "$ACTION" in
 
   list-sources)
     [ -f "$SETTINGS_FILE" ] || { echo "(no settings file)"; exit 0; }
-    GSTACK_SETTINGS_PATH="$SETTINGS_FILE" bun --no-env-file --config=/dev/null -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
+    GSTACK_SETTINGS_PATH="$SETTINGS_FILE" bun --no-env-file --config="${GSTACK_BUN_CONFIG:-/dev/null}" -e "$_HOOK_JS_PRELUDE"'gsMain(function () {
       const fs = require("fs");
       let settings = {};
       try { settings = JSON.parse(fs.readFileSync(process.env.GSTACK_SETTINGS_PATH, "utf8")); }

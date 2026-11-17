@@ -12,6 +12,8 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { gateCost, gateCostSentence } from './autoplan-gate-cost';
+import { renderDayOne } from './autoplan-owner-text';
 import { decisionId, PAGE_SIZE, renderGate, type GateList } from './gate-list';
 import { readJsonl, renderUrgentBlock, type DecisionRow } from './headless-artifacts';
 import type { ResultCodeName } from './result-codes';
@@ -72,6 +74,12 @@ export function renderDecisions(inputs: BriefInputs, page = 1): string {
   }).join('\n');
 }
 
+/** The reviewed plan's text, for the day-one block; '' when the run directory is not known or has no plan. */
+function planText(outDir: string | undefined, run: Record<string, any> | undefined): string {
+  const file = typeof run?.active_plan === 'string' ? run.active_plan : outDir ? path.join(outDir, 'plan-active.md') : undefined;
+  try { return file ? fs.readFileSync(file, 'utf8') : ''; } catch { return ''; }
+}
+
 export function renderBrief(inputs: BriefInputs, o: { page?: number; summary?: string; outDir?: string } = {}): string {
   const pages = Math.max(1, Math.ceil(inputs.gate.items.length / PAGE_SIZE));
   const page = Math.min(Math.max(1, o.page ?? 1), pages);
@@ -82,9 +90,11 @@ export function renderBrief(inputs: BriefInputs, o: { page?: number; summary?: s
     '',
     renderUrgentBlock(inputs.findings).trimEnd(),
     '',
+    ...renderDayOne(planText(o.outDir, inputs.run), inputs.gate.owner_words?.quotes),
     '### Summary',
     '',
     plainSummary(inputs, o.summary),
+    ...(o.outDir && inputs.run ? ['', gateCostSentence(gateCost(o.outDir, inputs.gate, { phase_order: inputs.run.phase_order ?? [], outside_enabled: inputs.run.outside_enabled !== false, spend_cap_usd: inputs.run.spend_cap_usd ?? null, scope_flags: inputs.run.scope_flags, lean: inputs.run.lean }))] : []),
     '',
     '### Decisions',
     '',
